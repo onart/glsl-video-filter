@@ -153,6 +153,8 @@ endmacro()
         YERM_PC/yr_bits.hpp
         YERM_PC/yr_threadpool.hpp
         YERM_PC/yr_graphics.h
+        ../fmp.cpp
+        ../fmp.h
 
         ${YERM_GRAPHICS}
         YERM_PC/yr_sys.h
