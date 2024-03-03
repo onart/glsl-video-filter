@@ -50,13 +50,21 @@ namespace onart {
 
 	Funnel::~Funnel() {
 		b = false;
-		transfer->join();
-		delete transfer;
-		transfer = 0;
+		if (transfer) {
+			transfer->join();
+			delete transfer;
+			transfer = 0;
+		}
 	}
 
 	void* Funnel::pick(int idx) {
 		return outputs[idx].pop1();
+	}
+
+	void Funnel::join() {
+		transfer->join();
+		delete transfer;
+		transfer = 0;
 	}
 
 	thread_local int errorCode;
@@ -93,6 +101,7 @@ namespace onart {
 	template<> void freec<AVFrame>(AVFrame* ctx) { av_frame_free(&ctx); }
 	template<> void freec<AVDictionary>(AVDictionary* d) { av_dict_free(&d); }
 	template<> void freec<SwsContext>(SwsContext* ctx) { sws_freeContext(ctx); }
+	template<> void freec<AVPacket>(AVPacket* pkt) { av_packet_free(&pkt); }
 
 	struct FFThreadContext {
 		smp<AVFormatContext> fmt{ nullptr };
@@ -106,6 +115,7 @@ namespace onart {
 		const AVCodec* decoder{ nullptr };
 		int videoStreamIndex = -1;
 		int width, height;
+		AVRational timeBase;
 		size_t durationUS;
 		AVPixelFormat pixelFormat;
 		std::vector<std::thread> workers;
@@ -125,7 +135,11 @@ namespace onart {
 
 #define _THIS reinterpret_cast<DecoderBase*>(structure)
 	VideoDecoder::VideoDecoder() { structure = new DecoderBase; }
-	VideoDecoder::~VideoDecoder() { delete _THIS; }
+	VideoDecoder::~VideoDecoder() { 
+		for (auto& th : _THIS->workers) { th.join(); }
+		_THIS->workers.clear();
+		delete _THIS;
+	}
 
 	bool VideoDecoder::open(const char* fileName, size_t threadCount) {
 		if (isOpened()) return false;
@@ -168,7 +182,7 @@ namespace onart {
 		}
 		for (size_t i = 0; i < threadCount; i++) {
 			auto& cdc = _THIS->ctx[i].codecCtx = avcodec_alloc_context3(_THIS->decoder);
-			if (cdc) {
+			if (!cdc) {
 				LOGRAW("Failed to allocate context");
 				return false;
 			}
@@ -178,6 +192,8 @@ namespace onart {
 				return false;
 			}
 		}
+		_THIS->timeBase = _THIS->ctx[0].codecCtx->time_base;
+		if (!_THIS->timeBase.den || !_THIS->timeBase.num) { _THIS->timeBase = _THIS->ctx[0].fmt->streams[vidStream]->time_base; }
 		_THIS->width = _THIS->ctx[0].fmt->streams[vidStream]->codecpar->width;
 		_THIS->height = _THIS->ctx[0].fmt->streams[vidStream]->codecpar->height;
 		_THIS->durationUS = _THIS->ctx[0].fmt->duration;
@@ -189,22 +205,31 @@ namespace onart {
 		return _THIS->ctx.size();
 	}
 
-	Converter VideoDecoder::makeFormatConverter() {
+	int64_t VideoDecoder::getTimeInMicro(int64_t t) {
+		return t * AV_TIME_BASE * _THIS->timeBase.num / _THIS->timeBase.den;
+	}
+
+	std::unique_ptr<Converter> VideoDecoder::makeFormatConverter() {
 		if (!isOpened()) return {};
-		Converter ret;
+		struct _cvt :Converter {};
+		std::unique_ptr<Converter> ret = std::make_unique<_cvt>();
 		auto base = new ConverterBase;
-		base->preprocessor = sws_getContext(_THIS->width, _THIS->height, _THIS->pixelFormat, _THIS->width, _THIS->height, AV_PIX_FMT_RGB32, SWS_POINT, nullptr, nullptr, nullptr);
+		base->preprocessor = sws_getContext(_THIS->width, _THIS->height, _THIS->pixelFormat, _THIS->width, _THIS->height, AV_PIX_FMT_RGBA, SWS_POINT, nullptr, nullptr, nullptr);
 		base->width = _THIS->width;
 		base->height = _THIS->height;
-		ret.structure = base;
+		ret->structure = base;
 		return ret;
 	}
 
-	VideoEncoder VideoDecoder::makeEncoder(int w, int h) {
+	std::unique_ptr<VideoEncoder> VideoDecoder::makeEncoder(int w, int h) {
 		if (!isOpened()) return {};
+		struct _enc :VideoEncoder {};
+		std::unique_ptr<VideoEncoder> ret = std::make_unique<_enc>();
 		auto base = new EncoderBase;
 		base->encoder = avcodec_find_encoder(_THIS->ctx[0].codecCtx->codec_id);
-		sws_getContext(w, h, AV_PIX_FMT_RGB32, w, h, _THIS->pixelFormat, SWS_POINT, nullptr, nullptr, nullptr);
+		base->preprocessor = sws_getContext(w, h, AV_PIX_FMT_RGB32, w, h, _THIS->pixelFormat, SWS_POINT, nullptr, nullptr, nullptr);
+		ret->structure = base;
+		return ret;
 	}
 
 	size_t VideoDecoder::getDuration() {
@@ -264,28 +289,29 @@ namespace onart {
 					for (; inputSectionIndex < sections.size(); inputSectionIndex++) { ctx.sections.push_back(sections[inputSectionIndex]); }
 				}
 			}
-			_THIS->workers.emplace_back([this, output, i, ctx]() {
+			_THIS->workers.emplace_back([this, output, i]() {
+				auto& ctx = _THIS->ctx[i];
 				FMCALL(avcodec_open2(ctx.codecCtx.ptr, _THIS->decoder, nullptr));
 				if (errorCode < 0) {
 					LOGRAW(errstr("codec open"));
 					return;
 				}
 				// decode time section
-				AVPacket packet;
+				smp<AVPacket> packet = av_packet_alloc();
 				smp<AVFrame> frame = av_frame_alloc();
 				for (section s : ctx.sections) {
 					int64_t sectionTick = s.start;
 					avcodec_flush_buffers(ctx.codecCtx);
-					av_seek_frame(ctx.fmt, -1, s.start, AVSEEK_FLAG_FRAME);
-					while (av_read_frame(ctx.fmt, &packet) == 0) {
-						if (packet.stream_index != _THIS->videoStreamIndex) continue;
-						int err = avcodec_send_packet(ctx.codecCtx, &packet);
+					int err = av_seek_frame(ctx.fmt, -1, s.start, AVSEEK_FLAG_BACKWARD);
+					while (av_read_frame(ctx.fmt, packet) == 0) {
+						if (packet->stream_index != _THIS->videoStreamIndex) continue;
+						int err = avcodec_send_packet(ctx.codecCtx, packet);
 						if (err == AVERROR(EAGAIN)) {}
 						else if (err == AVERROR_EOF) {
 							LOGRAW("EOF detected", s.start, s.end);
 							break;
 						}
-						else {
+						else if (err) {
 							av_make_error_string(errorString, sizeof(errorString), err);
 							LOGRAW(errorString);
 							break;
@@ -296,6 +322,10 @@ namespace onart {
 							avcodec_flush_buffers(ctx.codecCtx);
 							break;
 						}
+						int64_t lowEnd = frame->pts;
+						int64_t highEnd = lowEnd + frame->duration;
+						if (getTimeInMicro(highEnd) < s.start) { continue; }
+						else if (getTimeInMicro(lowEnd) > s.end) { break; }
 						AVFrame* cloned = av_frame_alloc();
 						cloned->format = frame->format;
 						cloned->width = frame->width;
@@ -306,8 +336,10 @@ namespace onart {
 						av_frame_get_buffer(cloned, 0); // align 32?
 						av_frame_copy(cloned, frame);
 						av_frame_copy_props(cloned, frame);
+						cloned->pts = getTimeInMicro(lowEnd);
+						cloned->duration = getTimeInMicro(highEnd);
 						output->push(cloned, i);
-						av_packet_unref(&packet);
+						av_packet_unref(packet);
 					}
 				}
 				output->push(nullptr, i);
@@ -319,13 +351,17 @@ namespace onart {
 #undef _THIS
 
 #define _THIS reinterpret_cast<ConverterBase*>(structure)
-	Converter::~Converter() { delete _THIS; }
+	Converter::~Converter() { 
+		for (auto& th : _THIS->workers) th.join();
+		delete _THIS;
+	}
 	void Converter::start(Funnel* input, Funnel* output) {
 		for (size_t i = 0; i < input->outThreadCount(); i++) {
 			_THIS->workers.emplace_back([this, input, output, i]() {
-				uint8_t* data = new uint8_t[_THIS->width * _THIS->height * 4];
 				while (!input->isInputEnd()) {
 					AVFrame* frame = (AVFrame*)input->pick(i);
+					if (!frame) continue;
+					uint8_t* data = new uint8_t[_THIS->width * _THIS->height * 4];
 					sws_scale(_THIS->preprocessor, frame->data, frame->linesize, 0, frame->height, &data, frame->linesize);
 					output->push(data, i);
 				}

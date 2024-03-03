@@ -30,7 +30,7 @@ namespace onart {
 				delete h;
 			}
 		}
-		inline void pushEnd() { push(this); total++; }
+		inline void pushEnd() { push(this); total+=2; }
 		inline void push(void* elem) volatile {
 			Node* oldTail = tail;
 			Node* newNode = new Node{ elem, nullptr };
@@ -74,6 +74,7 @@ namespace onart {
 		~Funnel();
 		// For writers
 		inline void push(void* p, int idx) { if (p) inputs[idx].push(p); else inputs[idx].pushEnd(); }
+		void join();
 	public:
 		// For readers
 		void* pick(int idx);
@@ -91,9 +92,11 @@ namespace onart {
 	class VideoFilter;
 	class FileVideoEncoder;
 
+	// in microseconds
 	struct section { int32_t start, end; };
 
 	class VideoEncoder {
+		friend class VideoDecoder;
 	public:
 	private:
 		void* structure;
@@ -106,6 +109,7 @@ namespace onart {
 	class Converter {
 		friend class VideoDecoder;
 	public:
+		Converter(const Converter&) = delete;
 		~Converter();
 		void start(Funnel* input, Funnel* output);
 	private:
@@ -117,8 +121,8 @@ namespace onart {
 	public:
 		VideoDecoder();
 		~VideoDecoder();
-		Converter makeFormatConverter();
-		VideoEncoder makeEncoder(int w, int h);
+		std::unique_ptr<Converter> makeFormatConverter();
+		std::unique_ptr<VideoEncoder> makeEncoder(int w, int h);
 		bool open(const char* fileName, size_t threadCount);
 		void start(Funnel* output, const std::vector<section>& sections = {});
 		void join();
@@ -129,6 +133,7 @@ namespace onart {
 		int getHeight();
 	private:
 		bool isOpened();
+		int64_t getTimeInMicro(int64_t);
 		void* structure;
 	};
 }
