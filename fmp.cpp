@@ -361,8 +361,9 @@ namespace onart {
 				while (!input->isInputEnd()) {
 					AVFrame* frame = (AVFrame*)input->pick(i);
 					if (!frame) continue;
-					uint8_t* data = new uint8_t[_THIS->width * _THIS->height * 4];
-					sws_scale(_THIS->preprocessor, frame->data, frame->linesize, 0, frame->height, &data, frame->linesize);
+					int pitch = _THIS->width * 4;
+					uint8_t* data = new uint8_t[_THIS->height * pitch];
+					sws_scale(_THIS->preprocessor, frame->data, frame->linesize, 0, frame->height, &data, &pitch);
 					output->push(data, i);
 				}
 				output->push(nullptr, i);
