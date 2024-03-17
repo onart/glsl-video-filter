@@ -9,84 +9,38 @@
 
 namespace onart {
 
-	// 1:1 thread safe
-	class PartiteLinkedList {
+	class RingBuffer4Frame {
+		friend class VideoDecoder;
+		friend class Converter;
+		friend class VideoEncoder;
 	public:
-		struct Node {
-			void* data;
-			Node* next;
-			inline void* operator new(size_t size) { return ::operator new(size); }
-			inline void operator delete(void* p) { return ::operator delete(p); }
-		};
-		inline uint64_t load() const { return total - taken; }
-		inline PartiteLinkedList() :taken(0), total(0) {
-			tail = new Node{};
-			head = new Node{ nullptr, tail };
-		}
-		inline ~PartiteLinkedList() {
-			while (head) {
-				Node* h = head;
-				head = head->next;
-				delete h;
-			}
-		}
-		inline void pushEnd() { push(this); total+=2; }
-		inline void push(void* elem) volatile {
-			Node* oldTail = tail;
-			Node* newNode = new Node{ elem, nullptr };
-			tail = newNode;
-			oldTail->next = newNode;
-			total++;
-		}
-		inline void* pop1() volatile {
-			if (total == taken) return nullptr;
-			taken++;
-			void* ret = head->data;
-			Node* h = head;
-			head = head->next;
-			delete h;
-			return ret;
-		}
-		inline void pushNode(Node* n) volatile {
-			Node* oldTail = tail;
-			Node* newNode = n;
-			tail = newNode;
-			oldTail->next = newNode;
-			total++;
-		}
-		inline Node* pop1Node() volatile {
-			if (total == taken) return nullptr;
-			taken++;
-			Node* h = head;
-			head = head->next;
-			return h;
-		}
+		RingBuffer4Frame(size_t bufferLength = 2);
+		~RingBuffer4Frame();
+		size_t load();
 	private:
-		Node* head;
-		Node* tail;
-		uint64_t taken, total;
-		bool complete;
+		void* structure;
 	};
 
-	class Funnel {
+	class RingBuffer4Texture {
+		friend class Converter;
+		friend class FrameFilter;
 	public:
-		Funnel(size_t inputCount, size_t outputCount);
-		~Funnel();
-		// For writers
-		inline void push(void* p, int idx) { if (p) inputs[idx].push(p); else inputs[idx].pushEnd(); }
-		void join();
-	public:
-		// For readers
-		void* pick(int idx);
-		inline bool isInputEnd() { return !b; }
-	public:
-		size_t inThreadCount() { return inputs.size(); }
-		size_t outThreadCount() { return outputs.size(); }
+		RingBuffer4Texture(size_t bufferLength = 2);
+		~RingBuffer4Texture();
+		size_t load();
 	private:
-		std::vector<PartiteLinkedList> inputs;
-		std::vector<PartiteLinkedList> outputs;
-		std::thread* transfer;
-		bool b;
+		void* structure;
+	};
+
+	class RingBuffer4RGBA {
+		friend class FrameFilter;
+		friend class Converter;
+	public:
+		RingBuffer4RGBA(size_t bufferLength = 2);
+		~RingBuffer4RGBA();
+		size_t load();
+	private:
+		void* structure;
 	};
 
 	class VideoFilter;
@@ -102,8 +56,18 @@ namespace onart {
 		void* structure;
 	};
 
-	class FilterSet {
+	class FrameFilter { // юс╫ц
+	public:
+		FrameFilter(int width, int height);
+		~FrameFilter();
+		void onLoop(RingBuffer4Texture* input);
+	private:
+		void* structure;
+	};
 
+	class FilterSet {
+	public:
+	private:
 	};
 
 	class Converter {
@@ -111,7 +75,8 @@ namespace onart {
 	public:
 		Converter(const Converter&) = delete;
 		~Converter();
-		void start(Funnel* input, Funnel* output);
+		void start(RingBuffer4Frame* input, RingBuffer4Texture* output, bool minmagLinear = true, bool extraWorker = true);
+		void start(RingBuffer4Texture* input, RingBuffer4Frame* output, bool extraWorker = true);
 	private:
 		Converter() = default;
 		void* structure;
@@ -123,10 +88,10 @@ namespace onart {
 		~VideoDecoder();
 		std::unique_ptr<Converter> makeFormatConverter();
 		std::unique_ptr<VideoEncoder> makeEncoder(int w, int h);
-		bool open(const char* fileName, size_t threadCount);
-		void start(Funnel* output, const std::vector<section>& sections = {});
-		void join();
-		//bool startMem(void* videoInMem, Funnel* output);
+		bool open(const char* fileName);
+		void start(RingBuffer4Frame* output, const std::vector<section>& sections = {}, bool extraWorker = true);
+		void terminate();
+		size_t load();
 	public:
 		size_t getDuration();
 		int getWidth();

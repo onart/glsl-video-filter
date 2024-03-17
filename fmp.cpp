@@ -9,63 +9,11 @@ extern "C" {
 }
 
 #include "YERM/YERM_PC/yr_graphics.h"
+#include "YERM/YERM_PC/yr_input.h"
 
 #include "YERM/YERM_PC/logger.hpp"
 
 namespace onart {
-
-	Funnel::Funnel(size_t inputCount, size_t outputCount) :inputs(inputCount), outputs(outputCount) {
-		transfer = new std::thread([this, inputCount, outputCount]() {
-			std::vector<PartiteLinkedList::Node*> inter;
-			int output = 0;
-			int ic = inputCount;
-			while (b) {
-				// read
-				for (auto& in : inputs) {
-					while (auto nd = in.pop1Node()) {
-						if (nd->data == &in) {
-							ic--;
-							break;
-						}
-						if (nd->data) {
-							inter.push_back(nd);
-						}
-					}
-				}
-				// write
-				for (auto n : inter) {
-					auto& q = outputs[output++];
-					q.pushNode(n);
-					if (output >= outputCount) output = 0;
-				}
-				if (ic == 0) { 
-					for (auto& o : outputs) { o.pushEnd(); }
-					b = false;
-					break;
-				}
-				inter.clear();
-			}
-		});
-	}
-
-	Funnel::~Funnel() {
-		b = false;
-		if (transfer) {
-			transfer->join();
-			delete transfer;
-			transfer = 0;
-		}
-	}
-
-	void* Funnel::pick(int idx) {
-		return outputs[idx].pop1();
-	}
-
-	void Funnel::join() {
-		transfer->join();
-		delete transfer;
-		transfer = 0;
-	}
 
 	thread_local int errorCode;
 	thread_local char errorString[128];	
@@ -103,69 +51,186 @@ namespace onart {
 	template<> void freec<SwsContext>(SwsContext* ctx) { sws_freeContext(ctx); }
 	template<> void freec<AVPacket>(AVPacket* pkt) { av_packet_free(&pkt); }
 
-	struct FFThreadContext {
-		smp<AVFormatContext> fmt{ nullptr };
-		smp<AVCodecContext> codecCtx{ nullptr };
-		std::vector<section> sections;
+	template<class T>
+	struct _1v1rb {
+		std::vector<T> buffer;
+		T nullObject{};
+		int size;
+		int input = 0;
+		int output = 0;
+		bool done = false;
+		std::mutex mtx;
+		std::condition_variable rcv;
+		std::condition_variable wcv;
+
+		inline int getNext(int i) const { return i + 1 < size ? i + 1 : 0; }
+
+		inline auto& get2Write() {
+			int ni = getNext(input);
+			if (ni == output) {
+				std::unique_lock _(mtx);
+				while (ni == output) {
+					wcv.wait(_);
+				}
+			}
+			return buffer[input];
+		}
+		inline void return2write() {
+			std::unique_lock _(mtx);
+			input = getNext(input);
+			rcv.notify_one();
+		}
+		inline const T& get2Read() {
+			if (input == output) {
+				if (done) return nullObject;
+				std::unique_lock _(mtx);
+				while (input == output) {
+					rcv.wait(_);
+				}
+			}
+			return buffer[output];
+		}
+		inline void return2Read() {
+			std::unique_lock _(mtx);
+			output = getNext(output);
+			wcv.notify_one();
+		}
 	};
+
+#define _THIS reinterpret_cast<_rb4f*>(structure)
+
+	struct _rb4f : public _1v1rb<AVFrame*> {
+		inline void init(int format, int width, int height) {
+			for (auto& fr : buffer) {
+				fr = av_frame_alloc();
+				fr->format = format;
+				fr->width = width;
+				fr->height = height;
+				av_frame_get_buffer(fr, 0); // align 32?
+			}
+		}
+	};
+
+	RingBuffer4Frame::RingBuffer4Frame(size_t size) {
+		structure = new _rb4f;
+		if (size < 2) size = 2;
+		_THIS->buffer.resize(size);
+		_THIS->size = size;
+	}
+
+	RingBuffer4Frame::~RingBuffer4Frame() {
+		for (AVFrame* f : _THIS->buffer) {
+			av_frame_free(&f);
+		}
+		delete _THIS;
+	}
+
+	size_t RingBuffer4Frame::load() {
+		int diff = _THIS->input - _THIS->output;
+		return diff < 0 ? diff : diff + _THIS->size;
+	}
+#undef _THIS
+
+#define _THIS reinterpret_cast<_rb4t*>(structure)
+
+	struct _rb4t :public _1v1rb<YRGraphics::pStreamTexture> {
+		inline void init(int width, int height, bool linear) {
+			for (auto& tx : buffer) {
+				tx = YRGraphics::createStreamTexture(INT32_MIN, width, height, linear);
+			}
+		}
+	};
+
+	RingBuffer4Texture::RingBuffer4Texture(size_t size) {
+		structure = new _rb4t;
+		if (size < 2) size = 2;
+		_THIS->buffer.resize(size);
+		_THIS->size = size;
+	}
+
+	RingBuffer4Texture::~RingBuffer4Texture() {
+		delete _THIS;
+		structure = nullptr;
+	}
+
+#undef _THIS
+
+#define _THIS reinterpret_cast<_rb4r*>(structure)
+	struct _rb4r :public _1v1rb<std::vector<uint32_t>> {
+		inline void init(int width, int height) {
+			for (auto& img : buffer) {
+				img.resize(width * height);
+			}
+		}
+	};
+
+	RingBuffer4RGBA::RingBuffer4RGBA(size_t size) {
+		structure = new _rb4r;
+		if (size < 2) size = 2;
+		_THIS->buffer.resize(size);
+		_THIS->size = size;
+	}
+#undef _THIS
 
 	struct DecoderBase {
 		DecoderBase() = default;
-		std::vector<FFThreadContext> ctx;
+		smp<AVFormatContext> fmt{ nullptr };
+		smp<AVCodecContext> codecCtx{ nullptr };
+		std::vector<section> sections;
 		const AVCodec* decoder{ nullptr };
 		int videoStreamIndex = -1;
-		int width, height;
+		int width = 0, height = 0;
 		AVRational timeBase;
 		size_t durationUS;
 		AVPixelFormat pixelFormat;
-		std::vector<std::thread> workers;
+		std::thread* worker;
+		bool forcedStop = false;
 	};
 
 	struct ConverterBase {
 		smp<SwsContext> preprocessor{ nullptr };
 		int width, height;
-		std::vector<std::thread> workers;
+		std::thread* worker;
+		bool forcedStop = false;
 	};
 
 	struct EncoderBase {
 		smp<SwsContext> preprocessor{ nullptr };
-		FFThreadContext ctx;
+		smp<AVFormatContext> fmt{ nullptr };
+		smp<AVCodecContext> codecCtx{ nullptr };
+		std::vector<section> sections;
 		const AVCodec* encoder{ nullptr };
 	};
 
 #define _THIS reinterpret_cast<DecoderBase*>(structure)
 	VideoDecoder::VideoDecoder() { structure = new DecoderBase; }
 	VideoDecoder::~VideoDecoder() { 
-		for (auto& th : _THIS->workers) { th.join(); }
-		_THIS->workers.clear();
+		if (_THIS->worker) { 
+			_THIS->worker->join();
+			delete _THIS->worker;
+		}
 		delete _THIS;
 	}
 
-	bool VideoDecoder::open(const char* fileName, size_t threadCount) {
+	bool VideoDecoder::open(const char* fileName) {
 		if (isOpened()) return false;
-		if (threadCount == 0) threadCount = 1;
-		_THIS->ctx.resize(threadCount);
-		for (size_t i = 0; i < threadCount; i++) {
-			auto& fmt = _THIS->ctx[i].fmt = avformat_alloc_context();
-			FMCALL(avformat_open_input(&fmt.ptr, fileName, nullptr, nullptr));
-			if (errorCode < 0) {
-				LOGRAW(errstr("open"));
-				return false;
-			}
+		_THIS->fmt = avformat_alloc_context();
+		FMCALL(avformat_open_input(&_THIS->fmt.ptr, fileName, nullptr, nullptr));
+		if (errorCode < 0) {
+			LOGRAW(errstr("open"));
+			return false;
 		}
 		LOGRAW(fileName, "opened");
-		for (size_t i = 0; i < threadCount; i++) {
-			auto& fmt = _THIS->ctx[i].fmt;
-			FMCALL(avformat_find_stream_info(fmt, nullptr));
-			if (errorCode < 0) {
-				LOGRAW(errstr("find stream info"));
-				return false;
-			}
+
+		FMCALL(avformat_find_stream_info(_THIS->fmt, nullptr));
+		if (errorCode < 0) {
+			LOGRAW(errstr("find stream info"));
+			return false;
 		}
 		LOGRAW("stream found");
 		int vidStream = -1;
-		for (int i = 0; i < _THIS->ctx[0].fmt->nb_streams; i++) {
-			if (_THIS->ctx[0].fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+		for (int i = 0; i < _THIS->fmt->nb_streams; i++) {
+			if (_THIS->fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
 				vidStream = i;
 				break;
 			}
@@ -175,34 +240,32 @@ namespace onart {
 			return false;
 		}		
 		_THIS->videoStreamIndex = vidStream;
-		_THIS->decoder = avcodec_find_decoder(_THIS->ctx[0].fmt->streams[vidStream]->codecpar->codec_id);
+		_THIS->decoder = avcodec_find_decoder(_THIS->fmt->streams[vidStream]->codecpar->codec_id);
 		if (!_THIS->decoder) {
 			LOGRAW("Failed to find video stream decoder");
 			return false;
 		}
-		for (size_t i = 0; i < threadCount; i++) {
-			auto& cdc = _THIS->ctx[i].codecCtx = avcodec_alloc_context3(_THIS->decoder);
-			if (!cdc) {
-				LOGRAW("Failed to allocate context");
-				return false;
-			}
-			FMCALL(avcodec_parameters_to_context(cdc, _THIS->ctx[0].fmt->streams[vidStream]->codecpar));
-			if (errorCode < 0) {
-				LOGRAW(errstr("codec context"));
-				return false;
-			}
+		_THIS->codecCtx = avcodec_alloc_context3(_THIS->decoder);
+		FMCALL(avcodec_parameters_to_context(_THIS->codecCtx, _THIS->fmt->streams[vidStream]->codecpar));
+		if (errorCode < 0) {
+			LOGRAW(errstr("codec context"));
+			return false;
 		}
-		_THIS->timeBase = _THIS->ctx[0].codecCtx->time_base;
-		if (!_THIS->timeBase.den || !_THIS->timeBase.num) { _THIS->timeBase = _THIS->ctx[0].fmt->streams[vidStream]->time_base; }
-		_THIS->width = _THIS->ctx[0].fmt->streams[vidStream]->codecpar->width;
-		_THIS->height = _THIS->ctx[0].fmt->streams[vidStream]->codecpar->height;
-		_THIS->durationUS = _THIS->ctx[0].fmt->duration;
-		_THIS->pixelFormat = _THIS->ctx[0].codecCtx->pix_fmt;
+		_THIS->timeBase = _THIS->codecCtx->time_base;
+		if (!_THIS->timeBase.den || !_THIS->timeBase.num) { _THIS->timeBase = _THIS->fmt->streams[vidStream]->time_base; }
+		_THIS->width = _THIS->fmt->streams[vidStream]->codecpar->width;
+		_THIS->height = _THIS->fmt->streams[vidStream]->codecpar->height;
+		_THIS->durationUS = _THIS->fmt->duration;
+		_THIS->pixelFormat = _THIS->codecCtx->pix_fmt;
 		return true;
 	}
 
 	bool VideoDecoder::isOpened() {
-		return _THIS->ctx.size();
+		return _THIS->width;
+	}
+
+	void VideoDecoder::terminate() {
+		_THIS->forcedStop = true;
 	}
 
 	int64_t VideoDecoder::getTimeInMicro(int64_t t) {
@@ -214,7 +277,7 @@ namespace onart {
 		struct _cvt :Converter {};
 		std::unique_ptr<Converter> ret = std::make_unique<_cvt>();
 		auto base = new ConverterBase;
-		base->preprocessor = sws_getContext(_THIS->width, _THIS->height, _THIS->pixelFormat, _THIS->width, _THIS->height, AV_PIX_FMT_RGBA, SWS_POINT, nullptr, nullptr, nullptr);
+		base->preprocessor = sws_getContext(_THIS->width, _THIS->height, _THIS->pixelFormat, _THIS->width, _THIS->height, AV_PIX_FMT_BGRA, SWS_POINT, nullptr, nullptr, nullptr);
 		base->width = _THIS->width;
 		base->height = _THIS->height;
 		ret->structure = base;
@@ -226,8 +289,8 @@ namespace onart {
 		struct _enc :VideoEncoder {};
 		std::unique_ptr<VideoEncoder> ret = std::make_unique<_enc>();
 		auto base = new EncoderBase;
-		base->encoder = avcodec_find_encoder(_THIS->ctx[0].codecCtx->codec_id);
-		base->preprocessor = sws_getContext(w, h, AV_PIX_FMT_RGB32, w, h, _THIS->pixelFormat, SWS_POINT, nullptr, nullptr, nullptr);
+		base->encoder = avcodec_find_encoder(_THIS->codecCtx->codec_id);
+		base->preprocessor = sws_getContext(w, h, AV_PIX_FMT_RGBA, w, h, _THIS->pixelFormat, SWS_POINT, nullptr, nullptr, nullptr);
 		ret->structure = base;
 		return ret;
 	}
@@ -240,111 +303,71 @@ namespace onart {
 	int VideoDecoder::getWidth() { return _THIS->width; }
 	int VideoDecoder::getHeight() { return _THIS->height; }
 
-	void VideoDecoder::start(Funnel* output, const std::vector<section>& sections) {
+	void VideoDecoder::start(RingBuffer4Frame* output, const std::vector<section>& sections, bool extraWorker) {
 		if (!isOpened()) return;
-		if (output->inThreadCount() != _THIS->ctx.size()) {
-			LOGRAW("Invalid thread count. Match it with funnel input");
-			return;
-		}
 
 		// validate sections (no overlapping / no start > end case)
-
-
-		// distribute time sections
-		int32_t totalTime = 0;
-		for (const section& s : sections) { totalTime += s.end - s.start; }
-		if (totalTime == 0) totalTime = getDuration();
-		int32_t slice = totalTime / _THIS->ctx.size();
-		section wholeRange{ 0, totalTime };
+		_THIS->sections = sections;
+		if (_THIS->sections.empty()) {
+			_THIS->sections.push_back(section{ 0,(int)_THIS->durationUS });
+		}
 		
-		int i = 0;
-		int32_t inputSectionIndex = 0;
-		int32_t startTime = sections.size() ? sections[0].start : 0;
-		for (auto& ctx : _THIS->ctx) {
-			int32_t restSlice = slice;
-			if (i != _THIS->ctx.size() - 1) {
-				while (restSlice > 0) {
-					section& next = ctx.sections.emplace_back();
-					next.start = startTime;
-					while (true) {
-						const section& inputNext = sections.size() ? sections[inputSectionIndex] : wholeRange;
-						if (restSlice > inputNext.end - startTime) {
-							next.end = inputNext.end;
-							restSlice -= inputNext.end - startTime;
-							inputSectionIndex++;
-							startTime = sections[inputSectionIndex].start;
-						}
-						else {
-							startTime += restSlice;
-							restSlice = 0;
-							break;
-						}
+		auto work = [this, output]() {
+			auto outputRing = reinterpret_cast<_rb4f*>(output->structure);
+			outputRing->init(_THIS->pixelFormat, _THIS->width, _THIS->height);
+			FMCALL(avcodec_open2(_THIS->codecCtx.ptr, _THIS->decoder, nullptr));
+			if (errorCode < 0) {
+				LOGRAW(errstr("codec open"));
+				return;
+			}
+			// decode time section
+			smp<AVPacket> packet = av_packet_alloc();
+			smp<AVFrame> frame = av_frame_alloc();
+			for (section s : _THIS->sections) {
+				int64_t sectionTick = s.start;
+				avcodec_flush_buffers(_THIS->codecCtx);
+				int err = av_seek_frame(_THIS->fmt, -1, s.start, AVSEEK_FLAG_BACKWARD);
+				while (av_read_frame(_THIS->fmt, packet) == 0) {
+					if (_THIS->forcedStop) return;
+					if (packet->stream_index != _THIS->videoStreamIndex) continue;
+					int err = avcodec_send_packet(_THIS->codecCtx, packet);
+					if (err == AVERROR(EAGAIN)) {}
+					else if (err == AVERROR_EOF) {
+						LOGRAW("EOF detected", s.start, s.end);
+						break;
 					}
+					else if (err) {
+						av_make_error_string(errorString, sizeof(errorString), err);
+						LOGRAW(errorString);
+						break;
+					}
+					err = avcodec_receive_frame(_THIS->codecCtx, frame);
+					if (err == AVERROR(EAGAIN)) { continue; }
+					else if (err == AVERROR_EOF) {
+						avcodec_flush_buffers(_THIS->codecCtx);
+						break;
+					}
+					int64_t lowEnd = frame->pts;
+					int64_t highEnd = lowEnd + frame->duration;
+					if (getTimeInMicro(highEnd) < s.start) { continue; }
+					else if (getTimeInMicro(lowEnd) > s.end) { break; }
+					AVFrame* cloned = outputRing->get2Write();
+					av_frame_copy(cloned, frame);
+					av_frame_copy_props(cloned, frame);
+					cloned->pts = getTimeInMicro(lowEnd);
+					cloned->duration = getTimeInMicro(highEnd);
+					outputRing->return2write();
+					av_packet_unref(packet);
 				}
 			}
-			else {
-				if (sections.size() == 0) { ctx.sections.emplace_back(section{ startTime, wholeRange.end }); }
-				else {
-					ctx.sections.emplace_back(section{ startTime, sections[inputSectionIndex++].end });
-					for (; inputSectionIndex < sections.size(); inputSectionIndex++) { ctx.sections.push_back(sections[inputSectionIndex]); }
-				}
-			}
-			_THIS->workers.emplace_back([this, output, i]() {
-				auto& ctx = _THIS->ctx[i];
-				FMCALL(avcodec_open2(ctx.codecCtx.ptr, _THIS->decoder, nullptr));
-				if (errorCode < 0) {
-					LOGRAW(errstr("codec open"));
-					return;
-				}
-				// decode time section
-				smp<AVPacket> packet = av_packet_alloc();
-				smp<AVFrame> frame = av_frame_alloc();
-				for (section s : ctx.sections) {
-					int64_t sectionTick = s.start;
-					avcodec_flush_buffers(ctx.codecCtx);
-					int err = av_seek_frame(ctx.fmt, -1, s.start, AVSEEK_FLAG_BACKWARD);
-					while (av_read_frame(ctx.fmt, packet) == 0) {
-						if (packet->stream_index != _THIS->videoStreamIndex) continue;
-						int err = avcodec_send_packet(ctx.codecCtx, packet);
-						if (err == AVERROR(EAGAIN)) {}
-						else if (err == AVERROR_EOF) {
-							LOGRAW("EOF detected", s.start, s.end);
-							break;
-						}
-						else if (err) {
-							av_make_error_string(errorString, sizeof(errorString), err);
-							LOGRAW(errorString);
-							break;
-						}
-						err = avcodec_receive_frame(ctx.codecCtx, frame);
-						if (err == AVERROR(EAGAIN)) { continue; }
-						else if (err == AVERROR_EOF) {
-							avcodec_flush_buffers(ctx.codecCtx);
-							break;
-						}
-						int64_t lowEnd = frame->pts;
-						int64_t highEnd = lowEnd + frame->duration;
-						if (getTimeInMicro(highEnd) < s.start) { continue; }
-						else if (getTimeInMicro(lowEnd) > s.end) { break; }
-						AVFrame* cloned = av_frame_alloc();
-						cloned->format = frame->format;
-						cloned->width = frame->width;
-						cloned->height = frame->height;
-						cloned->channels = frame->channels;
-						cloned->channel_layout = frame->channel_layout;
-						cloned->nb_samples = frame->nb_samples;
-						av_frame_get_buffer(cloned, 0); // align 32?
-						av_frame_copy(cloned, frame);
-						av_frame_copy_props(cloned, frame);
-						cloned->pts = getTimeInMicro(lowEnd);
-						cloned->duration = getTimeInMicro(highEnd);
-						output->push(cloned, i);
-						av_packet_unref(packet);
-					}
-				}
-				output->push(nullptr, i);
-			});
-			i++;
+			outputRing->done = true;
+		};
+
+		if (extraWorker) { 
+			_THIS->worker = new std::thread(work);
+		}
+		else { 
+			work();
 		}
 	}
 
@@ -352,23 +375,95 @@ namespace onart {
 
 #define _THIS reinterpret_cast<ConverterBase*>(structure)
 	Converter::~Converter() { 
-		for (auto& th : _THIS->workers) th.join();
+		if (_THIS->worker) {
+			_THIS->worker->join();
+			delete _THIS->worker;
+		}
 		delete _THIS;
 	}
-	void Converter::start(Funnel* input, Funnel* output) {
-		for (size_t i = 0; i < input->outThreadCount(); i++) {
-			_THIS->workers.emplace_back([this, input, output, i]() {
-				while (!input->isInputEnd()) {
-					AVFrame* frame = (AVFrame*)input->pick(i);
-					if (!frame) continue;
-					int pitch = _THIS->width * 4;
-					uint8_t* data = new uint8_t[_THIS->height * pitch];
-					sws_scale(_THIS->preprocessor, frame->data, frame->linesize, 0, frame->height, &data, &pitch);
-					output->push(data, i);
-				}
-				output->push(nullptr, i);
-			});
+	void Converter::start(RingBuffer4Frame* input, RingBuffer4Texture* output, bool linear, bool extraWorker) {
+		auto work = [this, input, output, linear]() {
+			auto irb = reinterpret_cast<_rb4f*>(input->structure);
+			auto orb = reinterpret_cast<_rb4t*>(output->structure);
+			orb->init(_THIS->width, _THIS->height, linear);
+			int pitch = _THIS->width * 4;
+			while (AVFrame* fr = irb->get2Read()) {
+				YRGraphics::pStreamTexture& tex = orb->get2Write();
+				tex->updateBy([this, pitch, fr](void* data, uint32_t) {
+					uint8_t* castedData = (uint8_t*)data;
+					sws_scale(_THIS->preprocessor, fr->data, fr->linesize, 0, fr->height, &castedData, &pitch);
+				});
+				irb->return2Read();
+				orb->return2write();
+			}
+			orb->done = true;
+		};
+		if (extraWorker) {
+			_THIS->worker = new std::thread(work);
 		}
+		else {
+			work();
+		}
+	}
+
+#undef _THIS
+
+#define _THIS reinterpret_cast<FilterBase*>(structure)
+
+	struct FilterBase {
+		YRGraphics::RenderPass2Screen* scr;
+		YRGraphics::Pipeline* pp;
+		YRGraphics::pMesh mesh;
+	};
+
+	FrameFilter::FrameFilter(int w, int h) {
+		structure = new FilterBase;
+		{
+			YRGraphics::RenderPassCreationOptions opts;
+			_THIS->scr = YRGraphics::createRenderPass2Screen(0, 0, opts);
+		}
+		{
+			YRGraphics::ShaderModuleCreationOptions opts;
+			const uint32_t NULL3_VERT[276] = { 119734787,65536,851979,51,0,131089,1,393227,1,1280527431,1685353262,808793134,0,196622,0,1,524303,0,4,1852399981,0,13,26,41,327752,11,0,11,0,327752,11,1,11,1,327752,11,2,11,3,327752,11,3,11,4,196679,11,2,262215,26,11,42,262215,41,30,0,131091,2,196641,3,2,196630,6,32,262167,7,6,4,262165,8,32,0,262187,8,9,1,262172,10,6,9,393246,11,7,6,10,10,262176,12,3,11,262203,12,13,3,262165,14,32,1,262187,14,15,0,262167,16,6,2,262187,8,17,3,262172,18,16,17,262187,6,19,3212836864,327724,16,20,19,19,262187,6,21,1077936128,327724,16,22,19,21,327724,16,23,21,19,393260,18,24,20,22,23,262176,25,1,14,262203,25,26,1,262176,28,7,18,262176,30,7,16,262187,6,33,0,262187,6,34,1065353216,262176,38,3,7,262176,40,3,16,262203,40,41,3,327724,16,42,33,33,262187,6,43,1073741824,327724,16,44,33,43,327724,16,45,43,33,393260,18,46,42,44,45,327734,2,4,0,3,131320,5,262203,28,29,7,262203,28,48,7,262205,14,27,26,196670,29,24,327745,30,31,29,27,262205,16,32,31,327761,6,35,32,0,327761,6,36,32,1,458832,7,37,35,36,33,34,327745,38,39,13,15,196670,39,37,196670,48,46,327745,30,49,48,27,262205,16,50,49,196670,41,50,65789,65592 };
+			opts.size = sizeof(NULL3_VERT);
+			opts.stage = YRGraphics::ShaderStage::VERTEX;
+			opts.source = NULL3_VERT;
+			auto vs = YRGraphics::createShader(0, opts);
+			const uint32_t COPY_FRAG[119] = { 119734787,65536,851979,20,0,131089,1,393227,1,1280527431,1685353262,808793134,0,196622,0,1,458767,4,4,1852399981,0,9,17,196624,4,7,262215,9,30,0,262215,13,34,0,262215,13,33,0,262215,17,30,0,131091,2,196641,3,2,196630,6,32,262167,7,6,4,262176,8,3,7,262203,8,9,3,589849,10,6,1,0,0,0,1,0,196635,11,10,262176,12,0,11,262203,12,13,0,262167,15,6,2,262176,16,1,15,262203,16,17,1,327734,2,4,0,3,131320,5,262205,11,14,13,262205,15,18,17,327767,7,19,14,18,196670,9,19,65789,65592 };
+			opts.size = sizeof(COPY_FRAG);
+			opts.stage = YRGraphics::ShaderStage::FRAGMENT;
+			opts.source = COPY_FRAG;
+			auto fs = YRGraphics::createShader(1, opts);
+			YRGraphics::PipelineCreationOptions pco;
+			pco.vertexShader = vs;
+			pco.fragmentShader = fs;
+			pco.pass2screen = _THIS->scr;
+			pco.shaderResources.usePush = false;
+			pco.shaderResources.pos0 = YRGraphics::ShaderResourceType::TEXTURE_1;
+			_THIS->pp = YRGraphics::createPipeline(0, pco);
+		}
+		{
+			_THIS->mesh = YRGraphics::createNullMesh(INT32_MIN, 3);
+		}
+	}
+
+	void FrameFilter::onLoop(RingBuffer4Texture* input) {
+		auto irb = reinterpret_cast<_rb4t*>(input->structure);
+		if (!Input::isKeyDown(Input::KeyCode::space)) return;
+		YRGraphics::pStreamTexture tx = irb->get2Read();
+		if (!tx) {
+			return;
+		}
+		_THIS->scr->start();
+		_THIS->scr->bind(0, tx);
+		_THIS->scr->invoke(_THIS->mesh);
+		_THIS->scr->execute();
+		_THIS->scr->wait();
+		irb->return2Read();
+	}
+
+	FrameFilter::~FrameFilter() {
+		delete _THIS;
 	}
 
 #undef _THIS

@@ -752,12 +752,14 @@ namespace onart {
             static void drop(int32_t name);
             /// @brief 이미지 데이터를 다시 설정합니다.
             void update(void* img);
+            void updateBy(std::function<void(void*, uint32_t)> function);
             const uint16_t width, height;
         protected:
-            StreamTexture(uint32_t txo, uint16_t width, uint16_t height);
+            StreamTexture(uint32_t txo, uint32_t pbo, uint16_t width, uint16_t height);
             ~StreamTexture();
         private:
             unsigned txo;
+            unsigned pbo;
     };
 
     struct GLMachine::PipelineInputVertexSpec {

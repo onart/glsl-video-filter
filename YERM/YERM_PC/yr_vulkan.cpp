@@ -1342,8 +1342,7 @@ namespace onart {
         singleton->reaper.push(buf, allocb);
     }
 
-    void VkMachine::StreamTexture::update(void* src) {
-        memcpy(mmap, src, (size_t)width * height * 4);
+    void VkMachine::StreamTexture::afterCopy() {
         vmaInvalidateAllocation(singleton->allocator, alloc, 0, VK_WHOLE_SIZE);
         vmaFlushAllocation(singleton->allocator, alloc, 0, VK_WHOLE_SIZE);
         VkCommandBuffer cb;
@@ -1374,6 +1373,16 @@ namespace onart {
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &cb;
         VkMachine::singleton->qSubmit(false, 1, &submitInfo, fence);
+    }
+
+    void VkMachine::StreamTexture::update(void* src) {
+        memcpy(mmap, src, (size_t)width * height * 4);
+        afterCopy();
+    }
+
+    void VkMachine::StreamTexture::updateBy(std::function<void(void*, uint32_t)> function) {
+        function(mmap, width * 4);
+        afterCopy();
     }
 
     VkMachine::TextureSet::~TextureSet() {

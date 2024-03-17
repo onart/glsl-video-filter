@@ -606,17 +606,15 @@ namespace onart {
         static void drop(int32_t name);
         /// @brief 이미지 데이터를 다시 설정합니다.
         void update(void* img);
+        void updateBy(std::function<void(void*, uint32_t)> function);
         const uint16_t width, height;
     protected:
-        StreamTexture(ID3D11Texture2D* txo, ID3D11ShaderResourceView* srv, uint16_t width, uint16_t height, bool linearSampler, void* mmap, uint64_t rowPitch);
+        StreamTexture(ID3D11Texture2D* txo, ID3D11ShaderResourceView* srv, uint16_t width, uint16_t height, bool linearSampler);
         ~StreamTexture();
     private:
         ID3D11Texture2D* txo;
         ID3D11ShaderResourceView* dset;
         bool linearSampled;
-        void* mmap;
-        uint64_t rowPitch;
-        const bool copyFull;
     };
 
     class D3D11Machine::RenderPass {

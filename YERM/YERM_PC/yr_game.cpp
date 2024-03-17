@@ -46,6 +46,12 @@ namespace onart{
     Window* Game::window = nullptr;
     void* Game::hd = nullptr;
 
+    VideoDecoder Game::decoder;
+    std::unique_ptr<Converter> Game::converter;
+    FrameFilter* Game::filter;
+    RingBuffer4Frame Game::rb1(3);
+    RingBuffer4Texture Game::rb2(3);
+
 #ifndef YR_NO_NEED_TO_USE_SEPARATE_EVENT_THREAD
 #define YR_NO_NEED_TO_USE_SEPARATE_EVENT_THREAD (BOOST_PLAT_ANDROID)
 #else
@@ -163,42 +169,7 @@ namespace onart{
                 _dt = static_cast<float>(ddt);
                 _idt = static_cast<float>(iddt);
                 YRGraphics::handle();
-                auto off = YRGraphics::getRenderPass(0);
-                auto rp2s = YRGraphics::getRenderPass2Screen(1);
-                auto vb = YRGraphics::getMesh(0);
-                auto tx = YRGraphics::getTexture(0);
-                int x, y;
-                if (Input::isKeyDown(Input::KeyCode::down)) {
-                    thr -= 0.01f;
-                    if (thr < 0) thr = 0.0f;
-
-                }
-                if (Input::isKeyDown(Input::KeyCode::up)) {
-                    thr += 0.01f;
-                    if (thr > 4)  thr = 4.0f;
-                }
-                printf("%f\r", thr);
-                window->getFramebufferSize(&x, &y);
-                ivec2 scr(x, y);
-                float aspect = 1.0f;// (float)x / y;
-                float pushed = PI<float> / 2;// std::abs(std::sin((double)_tp * 0.000000001));
-                mat4 rot = mat4(1, 0, 0, 0, 0, aspect, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1) * mat4::rotate(0, 0, (double)_tp * 0.000000001);
-                off->start();
-                if (loaded) {
-                    off->push(&rot, 0, 64);
-                    off->push(&thr, 64, 68);
-                    off->bind(0, tx);
-                    off->invoke(vb);
-                }
-                off->start();
-                off->invoke(vb);
-                off->execute();
-                rp2s->start();
-                rp2s->push(&rot, 0, 64);
-                rp2s->push(&thr, 64, 68);
-                rp2s->bind(0, off);
-                rp2s->invoke(vb);
-                rp2s->execute(off);
+                filter->onLoop(&rb2);
             }
 #if !YR_NO_NEED_TO_USE_SEPARATE_EVENT_THREAD
         });
@@ -252,6 +223,7 @@ namespace onart{
 
     void Game::finalize(){
         Audio::finalize();
+        rb2.~RingBuffer4Texture();
         delete vk;
         delete window; // Window보다 스왑체인을 먼저 없애야 함 (안 그러면 X11에서 막혀서 프로그램이 안 끝남)
         window = nullptr;
@@ -274,69 +246,19 @@ namespace onart{
         window->windowSizeCallback = recordSizeEvent;
         window->scrollCallback = recordScrollEvent;
 #endif
+        decoder.open("dbg.mp4");
+        int width = decoder.getWidth();
+        int height = decoder.getHeight();
+        auto duration = decoder.getDuration();
+        converter = std::move(decoder.makeFormatConverter());
 
-        YRGraphics::createRenderPass2Cube(123, 512, 512, false, true);
-        YRGraphics::RenderPassCreationOptions rpopts{};
-        rpopts.width = 128;
-        rpopts.height = 128;
-        rpopts.linearSampled = false;
-        rpopts.subpassCount = 2;
-        auto offrp = YRGraphics::createRenderPass(0, rpopts);
-        rpopts.subpassCount = 1;
-        auto rp2s = YRGraphics::createRenderPass2Screen(1, 0, rpopts);
-        using testv_t = YRGraphics::Vertex<vec3, vec2>;
-        //YRGraphics::createTexture(0, TEX0, sizeof(TEX0));
-        //loaded = true;
-        YRGraphics::asyncCreateTexture(0, TEX0, sizeof(TEX0), [](variant8) { loaded = true; });
-        testv_t verts[]{ {{-1,-1,0},{0,0}},{{-1,1,0},{0,1}},{{1,-1,0},{1,0}},{{1,1,0},{1,1}} };
-        uint16_t inds[]{ 0,1,2,2,1,3 };
-        YRGraphics::MeshCreationOptions mopts;
-        mopts.fixed = true;
-        mopts.vertexCount = sizeof(verts) / sizeof(verts[0]);
-        mopts.vertices = verts;
-        mopts.indices = inds;
-        mopts.indexCount = sizeof(inds) / sizeof(inds[0]);
-        mopts.singleVertexSize = sizeof(verts[0]);
-        mopts.singleIndexSize = sizeof(inds[0]);
-        YRGraphics::createMesh(0, mopts);
-        YRGraphics::createNullMesh(3, 1);
+        decoder.start(&rb1, { onart::section{0, 10000000} });
+        converter->start(&rb1, &rb2);
+        filter = new FrameFilter(0, 0);
+        
 #ifdef YR_USE_VULKAN
         if constexpr (YRGraphics::VULKAN_GRAPHICS) {
-            VkVertexInputAttributeDescription desc[2];
-            testv_t::info(desc, 0);
-            auto vs = YRGraphics::createShader(0, { TEST_VERT, sizeof(TEST_VERT) });
-            auto fs = YRGraphics::createShader(1, { TEST_FRAG, sizeof(TEST_FRAG) });
-            YRGraphics::PipelineCreationOptions pipeInfo{};
-            pipeInfo.vertexSpec = desc;
-            pipeInfo.vertexAttributeCount = 2;
-            pipeInfo.vertexSize = sizeof(testv_t);
-            pipeInfo.pass = offrp;
-            pipeInfo.subpassIndex = 0;
-            pipeInfo.vertexShader = vs;
-            pipeInfo.fragmentShader = fs;
-            pipeInfo.shaderResources.pos0 = YRGraphics::ShaderResourceType::TEXTURE_1;
-            pipeInfo.shaderResources.usePush = true;
-            YRGraphics::createPipeline(0, pipeInfo);
-            vs = YRGraphics::createShader(2, { TEST_IA_VERT, sizeof(TEST_IA_VERT) });
-            fs = YRGraphics::createShader(3, { TEST_IA_FRAG, sizeof(TEST_IA_FRAG) });
-            pipeInfo.vertexShader = vs;
-            pipeInfo.fragmentShader = fs;
-            pipeInfo.subpassIndex = 1;
-            pipeInfo.shaderResources.pos0 = YRGraphics::ShaderResourceType::INPUT_ATTACHMENT_1;
-            pipeInfo.vertexSpec = nullptr;
-            pipeInfo.vertexAttributeCount = 0;
-            YRGraphics::createPipeline(1, pipeInfo);
-            vs = YRGraphics::createShader(4, { TEST_TX_VERT, sizeof(TEST_TX_VERT) });
-            fs = YRGraphics::createShader(5, { SCALEPX, sizeof(SCALEPX) });
-            pipeInfo.vertexShader = vs;
-            pipeInfo.fragmentShader = fs;
-            pipeInfo.shaderResources.pos0 = YRGraphics::ShaderResourceType::TEXTURE_1;
-            pipeInfo.pass = nullptr;
-            pipeInfo.pass2screen = rp2s;
-            pipeInfo.subpassIndex = 0;
-            YRGraphics::createPipeline(2, pipeInfo);
-            //YRGraphics::createTextureFromImage("g256.png", 0,YRGraphics::isSurfaceSRGB(),YRGraphics::IT_USE_ORIGINAL,false); loaded = true;
-            //loaded = true; YRGraphics::createTexture(TEX0, sizeof(TEX0), 4, 0, YRGraphics::isSurfaceSRGB());
+            
         }
 #elif defined(YR_USE_OPENGL)
         const char TEST_GL_VERT1[] = R"(

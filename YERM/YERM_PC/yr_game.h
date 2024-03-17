@@ -17,6 +17,8 @@
 #include "yr_constants.hpp"
 #include "yr_sys.h"
 
+#include "../../fmp.h"
+
 #include <cstdint>
 #include <chrono>
 #include <string>
@@ -69,6 +71,12 @@ namespace onart{
             static bool init();
             static void update();
             static void render();
+    private:
+            static VideoDecoder decoder;
+            static std::unique_ptr<Converter> converter;
+            static FrameFilter* filter;
+            static RingBuffer4Frame rb1;
+            static RingBuffer4Texture rb2;
     };
 }
 #undef YRGraphics

@@ -1,6 +1,7 @@
 #include "logger.hpp"
 #include "yr_sys.h"
 #include "yr_graphics.h"
+#include "yr_game.h"
 
 #include "../../fmp.h"
 
@@ -24,27 +25,6 @@ int main(int argc, char* argv[]){
     }
     */
 
-    onart::VideoDecoder decoder;
-    decoder.open("dbg.mp4", 1);
-    int width = decoder.getWidth();
-    int height = decoder.getHeight();
-    auto duration = decoder.getDuration();
-    auto converter = decoder.makeFormatConverter();
-    onart::Funnel funnel1(1, 1);
-    onart::Funnel funnel2(1, 1);
-    decoder.start(&funnel1, { onart::section{0, 1000000} });
-    converter->start(&funnel1, &funnel2);
-    funnel2.join();
-    funnel2.pick(0);
-    funnel2.pick(0);
-    uint8_t* image = (uint8_t*)funnel2.pick(0);
-    if (image) {
-        stbi_write_png("aa.png", width, height, 4, image, 0);
-    }
-
-    onart::Window::init();
-    onart::YRGraphics* yg = new onart::YRGraphics;
-    
-    delete yg;
-    onart::Window::terminate();
+    onart::Game game;
+    game.start();
 }
