@@ -52,6 +52,9 @@ namespace onart {
 	class VideoEncoder {
 		friend class VideoDecoder;
 	public:
+		void start(const char* fileName);
+		void push(const uint8_t* rgba, size_t duration);
+		void end();
 	private:
 		void* structure;
 	};

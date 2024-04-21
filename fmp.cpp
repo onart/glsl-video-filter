@@ -198,6 +198,10 @@ namespace onart {
 		smp<SwsContext> preprocessor{ nullptr };
 		smp<AVFormatContext> fmt{ nullptr };
 		smp<AVCodecContext> codecCtx{ nullptr };
+		AVStream* videoStream{ nullptr };
+		smp<AVFrame> rgbaFrame{ nullptr };
+		smp<AVFrame> preprocessedFrame{ nullptr };
+		smp<AVPacket> compressedFrame{ nullptr };
 		std::vector<section> sections;
 		const AVCodec* encoder{ nullptr };
 	};
@@ -290,7 +294,42 @@ namespace onart {
 		std::unique_ptr<VideoEncoder> ret = std::make_unique<_enc>();
 		auto base = new EncoderBase;
 		base->encoder = avcodec_find_encoder(_THIS->codecCtx->codec_id);
-		base->preprocessor = sws_getContext(w, h, AV_PIX_FMT_RGBA, w, h, _THIS->pixelFormat, SWS_POINT, nullptr, nullptr, nullptr);
+		base->codecCtx = avcodec_alloc_context3(base->encoder);
+		base->codecCtx->bit_rate = _THIS->codecCtx->bit_rate * w * h / _THIS->width / _THIS->height;
+		if (base->codecCtx->bit_rate == 0) {
+			base->codecCtx->bit_rate = (int64_t)w * h * _THIS->codecCtx->framerate.num / _THIS->codecCtx->framerate.den;
+		}
+		base->codecCtx->width = w;
+		base->codecCtx->height = h;
+		base->codecCtx->time_base = _THIS->timeBase;
+		base->codecCtx->framerate = _THIS->codecCtx->framerate;
+		base->codecCtx->gop_size = 4;
+		base->codecCtx->max_b_frames = 1;
+		base->codecCtx->pix_fmt = _THIS->pixelFormat;
+
+		base->rgbaFrame = av_frame_alloc();
+		base->rgbaFrame->format = AV_PIX_FMT_RGBA;
+		base->rgbaFrame->width = w;
+		base->rgbaFrame->height = h;
+		FMCALL(av_frame_get_buffer(base->rgbaFrame, 0));
+		if (errorCode < 0) {
+			LOGRAW(errstr("frame container allocation"));
+		}
+
+		if (_THIS->pixelFormat != AV_PIX_FMT_RGBA) {
+			base->preprocessor = sws_getContext(w, h, AV_PIX_FMT_RGBA, w, h, _THIS->pixelFormat, SWS_POINT, nullptr, nullptr, nullptr);
+			base->preprocessedFrame = av_frame_alloc();
+			base->preprocessedFrame->format = _THIS->pixelFormat;
+			base->preprocessedFrame->width = w;
+			base->preprocessedFrame->height = h;
+			FMCALL(av_frame_get_buffer(base->preprocessedFrame, 0));
+			if (errorCode < 0) {
+				LOGRAW(errstr("frame container allocation"));
+			}
+		}
+
+		base->compressedFrame = av_packet_alloc();
+		
 		ret->structure = base;
 		return ret;
 	}
@@ -329,7 +368,9 @@ namespace onart {
 				int err = av_seek_frame(_THIS->fmt, -1, s.start, AVSEEK_FLAG_BACKWARD);
 				while (av_read_frame(_THIS->fmt, packet) == 0) {
 					if (_THIS->forcedStop) return;
-					if (packet->stream_index != _THIS->videoStreamIndex) continue;
+					if (packet->stream_index != _THIS->videoStreamIndex) {
+						continue;
+					}
 					int err = avcodec_send_packet(_THIS->codecCtx, packet);
 					if (err == AVERROR(EAGAIN)) {}
 					else if (err == AVERROR_EOF) {
@@ -464,6 +505,75 @@ namespace onart {
 
 	FrameFilter::~FrameFilter() {
 		delete _THIS;
+	}
+
+#undef _THIS
+
+#define _THIS reinterpret_cast<EncoderBase*>(structure)
+	
+	void VideoEncoder::start(const char* fileName) {
+		FMCALL(avformat_alloc_output_context2(&_THIS->fmt.ptr, nullptr, nullptr, fileName));
+		if (errorCode < 0) {
+			LOGRAW(errstr("video encoder start"));
+			return;
+		}
+		_THIS->videoStream = avformat_new_stream(_THIS->fmt, _THIS->encoder);
+		if (!_THIS->videoStream) {
+			LOGRAW("Failed to add new stream");
+			return;
+		}
+		FMCALL(avcodec_open2(_THIS->codecCtx, _THIS->encoder, nullptr));
+		if (errorCode < 0) {
+			LOGRAW(errstr("codec open"));
+			return;
+		}
+		FMCALL(avformat_write_header(_THIS->fmt, nullptr));
+		if (errorCode < 0) {
+			LOGRAW(errstr("file header"));
+			return;
+		}
+	}
+
+	void VideoEncoder::push(const uint8_t* rgba, size_t duration) {
+		if (!_THIS->fmt) {
+			LOGRAW("You must start the encoder before pushing frame data");
+			return;
+		}
+		AVFrame* pFrame{};
+		std::memcpy(_THIS->rgbaFrame->data, rgba, _THIS->codecCtx->width * _THIS->codecCtx->height * 4);
+		if (_THIS->preprocessor) {
+			sws_scale(_THIS->preprocessor, _THIS->rgbaFrame->data, _THIS->rgbaFrame->linesize, 0, _THIS->rgbaFrame->height, _THIS->preprocessedFrame->data, _THIS->preprocessedFrame->linesize);
+			pFrame = _THIS->preprocessedFrame;
+		}
+		else {
+			pFrame = _THIS->rgbaFrame;
+		}
+		int err = avcodec_send_frame(_THIS->codecCtx, pFrame);
+		if (err < 0) {
+			LOGRAW("Failed to send frame");
+			return;
+		}
+		err = avcodec_receive_packet(_THIS->codecCtx, _THIS->compressedFrame);
+		if (err < 0) {
+			LOGRAW("Failed to recieve packet");
+			return;
+		}
+		_THIS->compressedFrame->stream_index = 0; // video index == 0(which I've just added)
+		_THIS->compressedFrame->duration = duration;
+		av_interleaved_write_frame(_THIS->fmt, _THIS->compressedFrame);
+	}
+
+	void VideoEncoder::end() {
+		if (!_THIS->fmt) {
+			LOGRAW("You must start the encoder before pushing frame data");
+			return;
+		}
+		FMCALL(av_write_trailer(_THIS->fmt));
+		if (errorCode < 0) {
+			LOGRAW(errstr("file trailer"));
+			return;
+		}
+		_THIS->fmt = {};
 	}
 
 #undef _THIS
