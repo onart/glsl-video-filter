@@ -3550,7 +3550,7 @@ namespace onart {
             submitInfo.pWaitSemaphores = &other->semaphore;
             submitInfo.pWaitDstStageMask = waitStages;
         }
-        submitInfo.signalSemaphoreCount = 0;
+        submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = &semaphore;
 
         if((reason = vkResetFences(singleton->device, 1, &fence)) != VK_SUCCESS){

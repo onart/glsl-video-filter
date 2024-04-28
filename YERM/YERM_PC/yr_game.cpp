@@ -46,12 +46,6 @@ namespace onart{
     Window* Game::window = nullptr;
     void* Game::hd = nullptr;
 
-    VideoDecoder Game::decoder;
-    std::unique_ptr<Converter> Game::converter;
-    FrameFilter* Game::filter;
-    RingBuffer4Frame Game::rb1(3);
-    RingBuffer4Texture Game::rb2(3);
-
 #ifndef YR_NO_NEED_TO_USE_SEPARATE_EVENT_THREAD
 #define YR_NO_NEED_TO_USE_SEPARATE_EVENT_THREAD (BOOST_PLAT_ANDROID)
 #else
@@ -169,7 +163,6 @@ namespace onart{
                 _dt = static_cast<float>(ddt);
                 _idt = static_cast<float>(iddt);
                 YRGraphics::handle();
-                filter->onLoop(&rb2);
             }
 #if !YR_NO_NEED_TO_USE_SEPARATE_EVENT_THREAD
         });
@@ -223,7 +216,6 @@ namespace onart{
 
     void Game::finalize(){
         Audio::finalize();
-        rb2.~RingBuffer4Texture();
         delete vk;
         delete window; // Window보다 스왑체인을 먼저 없애야 함 (안 그러면 X11에서 막혀서 프로그램이 안 끝남)
         window = nullptr;
@@ -246,15 +238,6 @@ namespace onart{
         window->windowSizeCallback = recordSizeEvent;
         window->scrollCallback = recordScrollEvent;
 #endif
-        decoder.open("dbg.mp4");
-        int width = decoder.getWidth();
-        int height = decoder.getHeight();
-        auto duration = decoder.getDuration();
-        converter = std::move(decoder.makeFormatConverter());
-
-        decoder.start(&rb1, { onart::section{0, 10000000} });
-        converter->start(&rb1, &rb2);
-        filter = new FrameFilter(0, 0);
         
 #ifdef YR_USE_VULKAN
         if constexpr (YRGraphics::VULKAN_GRAPHICS) {

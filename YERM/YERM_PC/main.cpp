@@ -10,6 +10,7 @@ extern "C" {
     #include "../externals/ffmpeg/include/libavcodec/avcodec.h"
     #include "../externals/ffmpeg/include/libswscale/swscale.h"
     #include "../externals/ffmpeg/include/libavutil/imgutils.h"
+    #include "../externals/ffmpeg/include/libavutil/opt.h"
 }
 
 #ifdef YR_USE_VULKAN
@@ -87,6 +88,11 @@ int main(int argc, char* argv[]){
     LOGRAW("Compiling shader..");
     onart::Window::init();
     onart::YRGraphics* _gr(new onart::YRGraphics);
+    onart::Window::CreationOptions wopts{};
+    wopts.height = 720;
+    wopts.width = 1280;
+    onart::Window* window = new onart::Window(nullptr, &wopts);
+    _gr->addWindow(0, window);
 
     onart::YRGraphics::ShaderModuleCreationOptions shaderOpts{};
     onart::shader_t vertShader{}, fragShader{};
@@ -225,6 +231,7 @@ int main(int argc, char* argv[]){
     rpOpts.height = h;
     rpOpts.subpassCount = 1;
     auto renderPass = onart::YRGraphics::createRenderPass(0, rpOpts);
+    auto wd = onart::YRGraphics::createRenderPass2Screen(0, 0, rpOpts);
     auto quad = onart::YRGraphics::createNullMesh(0, 3);
     {
         onart::YRGraphics::PipelineCreationOptions pipeOpts;
@@ -236,9 +243,10 @@ int main(int argc, char* argv[]){
         pipeOpts.shaderResources.pos0 = onart::YRGraphics::ShaderResourceType::TEXTURE_1;
 
         auto pp = onart::YRGraphics::createPipeline(0, pipeOpts);
+        wd->usePipeline(pp, 0);
     }
 
-    onart::YRGraphics::pStreamTexture tex = onart::YRGraphics::createStreamTexture(0, videoStream->codecpar->width, videoStream->codecpar->height, !(w == videoStream->codecpar->width && h == videoStream->codecpar->height));
+    onart::YRGraphics::pStreamTexture tex = onart::YRGraphics::createStreamTexture(0, videoStream->codecpar->width, videoStream->codecpar->height, !(w % videoStream->codecpar->width == 0 && h % videoStream->codecpar->height == 0));
     if (!tex) {
         LOGRAW("Failed to create stream texture");
         return 5;
@@ -256,7 +264,10 @@ int main(int argc, char* argv[]){
         avcodec_parameters_copy(outputFmt->streams[i]->codecpar, inputFmt->streams[i]->codecpar);
     }
     AVStream* outputVideoStream = outputFmt->streams[videoStreamIndex];
-    outputVideoStream->time_base = timeBase;
+
+    outputVideoStream->time_base = videoStream->time_base;
+    LOGWITH(decContext->framerate.num, decContext->framerate.den);
+    LOGWITH(videoStream->time_base.num, videoStream->time_base.den);
     double totalFrame = 1.0 / outputVideoStream->nb_frames;
     encContext->bit_rate = decContext->bit_rate * w * h / (videoStream->codecpar->width * videoStream->codecpar->height);
     if (encContext->bit_rate == 0) {
@@ -264,12 +275,13 @@ int main(int argc, char* argv[]){
     }
     encContext->width = w;
     encContext->height = h;
-    encContext->time_base = timeBase;
+    encContext->time_base = outputVideoStream->time_base;
     encContext->framerate = decContext->framerate;
     encContext->gop_size = 4;
     encContext->max_b_frames = 1;
     encContext->pix_fmt = decContext->pix_fmt;
     avcodec_parameters_from_context(outputVideoStream->codecpar, encContext);
+    //av_opt_set(encContext->priv_data, "crf", "1", 0);
     
     errcode = avcodec_open2(encContext, encoder, nullptr);
     ON_ERROR_RETURN("Encoder codec context open", 4);
@@ -289,9 +301,11 @@ int main(int argc, char* argv[]){
     LOGRAW("Encoder ready:", encoder->long_name);
     
     smp<SwsContext> preproc1{ nullptr }, preproc2{ nullptr };
-    if (decContext->pix_fmt != AV_PIX_FMT_RGBA) {
-        preproc1 = sws_getContext(videoStream->codecpar->width, videoStream->codecpar->height, decContext->pix_fmt, videoStream->codecpar->width, videoStream->codecpar->height, AV_PIX_FMT_RGBA, SWS_POINT, nullptr, nullptr, nullptr);
-        preproc2 = sws_getContext(videoStream->codecpar->width, videoStream->codecpar->height, AV_PIX_FMT_BGRA, videoStream->codecpar->width, videoStream->codecpar->height, encContext->pix_fmt, SWS_POINT, nullptr, nullptr, nullptr);
+    if (decContext->pix_fmt != AV_PIX_FMT_BGRA) {
+        preproc1 = sws_getContext(videoStream->codecpar->width, videoStream->codecpar->height, decContext->pix_fmt, videoStream->codecpar->width, videoStream->codecpar->height, AV_PIX_FMT_BGRA, SWS_POINT, nullptr, nullptr, nullptr);
+    }
+    if (encContext->pix_fmt != AV_PIX_FMT_RGBA) {
+        preproc2 = sws_getContext(videoStream->codecpar->width, videoStream->codecpar->height, AV_PIX_FMT_RGBA, videoStream->codecpar->width, videoStream->codecpar->height, encContext->pix_fmt, SWS_POINT, nullptr, nullptr, nullptr);
     }
     smp<AVPacket> decPacket = av_packet_alloc(), encPacket = av_packet_alloc();
     smp<AVFrame> 
@@ -331,11 +345,9 @@ int main(int argc, char* argv[]){
                 avcodec_flush_buffers(decContext);
                 break;
             }
-            encFrame->pts = decPacket->pts;
-            encFrame->duration = decPacket->duration;
             av_frame_copy(procFrame, decFrame);
             av_frame_copy_props(procFrame, decFrame);
-            av_packet_unref(decPacket);
+            //av_packet_unref(decPacket); // this was incorrect..
             if (invoked) {
                 // encode
                 renderPass->wait();
@@ -352,6 +364,8 @@ int main(int argc, char* argv[]){
                     }
                 }
 
+                encFrame->pts = pts;
+                encFrame->duration = frameDuration;
                 errcode = avcodec_send_frame(encContext, encFrame);
                 if (errcode < 0) {
                     LOGRAW("Failed to send frame", encFrame->pts);
@@ -368,11 +382,14 @@ int main(int argc, char* argv[]){
                 }
                 else {
                     encPacket->stream_index = videoStreamIndex;
+                    av_packet_rescale_ts(encPacket, videoStream->time_base, outputVideoStream->time_base);
                     av_interleaved_write_frame(outputFmt, encPacket);
                 }
                 printf("\r%.2f%%", encFrame->pts * 100 * timeBase.num / timeBase.den / duration);
             }
             else { invoked = true; }
+            pts = decFrame->pts;
+            frameDuration = decFrame->duration;
             tex->updateBy([&preproc1, &procFrame](void* data, uint32_t) {
                 if (preproc1) {
                     uint8_t* castedData = (uint8_t*)data;
@@ -392,8 +409,13 @@ int main(int argc, char* argv[]){
             renderPass->bind(0, tex);
             renderPass->invoke(quad);
             renderPass->execute();
+            wd->start();
+            wd->bind(0, renderPass);
+            wd->invoke(quad);
+            wd->execute(renderPass);
         }
         else {
+            av_packet_rescale_ts(encPacket, videoStream->time_base, outputVideoStream->time_base);
             av_interleaved_write_frame(outputFmt, decPacket);
         }
     }
@@ -414,6 +436,8 @@ int main(int argc, char* argv[]){
             }
         }
 
+        encFrame->pts = pts;
+        encFrame->duration = frameDuration;
         errcode = avcodec_send_frame(encContext, encFrame);
         if (errcode < 0) {
             LOGRAW("Failed to send frame", encFrame->pts);
@@ -426,6 +450,7 @@ int main(int argc, char* argv[]){
             LOGRAW(toString(av_make_error_string(errorString, sizeof(errorString), errcode)));
         }
         encPacket->stream_index = videoStreamIndex;
+        av_packet_rescale_ts(encPacket, videoStream->time_base, outputVideoStream->time_base);
         av_interleaved_write_frame(outputFmt, encPacket);
     }
     av_write_trailer(outputFmt);
@@ -435,4 +460,5 @@ int main(int argc, char* argv[]){
     quad.reset();
     tex.reset();
     delete _gr;
+    onart::Window::terminate();
 }
