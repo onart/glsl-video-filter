@@ -1193,7 +1193,7 @@ namespace onart {
         imgInfo.flags = 0;
         const auto& physicalDevice = singleton->physicalDevice;
         uint32_t qfi[2] = { physicalDevice.gq, physicalDevice.subq };
-        if (physicalDevice.gq == physicalDevice.subq) {
+        if (physicalDevice.gq != physicalDevice.subq) {
             imgInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
             imgInfo.pQueueFamilyIndices = qfi;
             imgInfo.queueFamilyIndexCount = 2;
@@ -3550,7 +3550,7 @@ namespace onart {
             submitInfo.pWaitSemaphores = &other->semaphore;
             submitInfo.pWaitDstStageMask = waitStages;
         }
-        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.signalSemaphoreCount = 0;
         submitInfo.pSignalSemaphores = &semaphore;
 
         if((reason = vkResetFences(singleton->device, 1, &fence)) != VK_SUCCESS){
